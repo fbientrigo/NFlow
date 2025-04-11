@@ -1,0 +1,25 @@
+# General settings
+run_base_dir: outputs
+device: "cuda"
+batch_size: 32
+
+# Data settings
+datapath_mothers: "/path/to/muonsGAN_data_afterMS.h5"
+data:
+  train_ratio: 0.8
+  val_ratio: 0.2
+
+# Model settings
+model:
+  name: "RealNVP_Flow"
+  hidden_dim: 160
+  n_layers: 10
+  learning_rate: 0.0004
+  epochs: 300
+  patience: 34
+  weight_decay: 6.3e-07
+
+# Logging settings
+logging:
+  level: "INFO"
+  file: "logs/project.log"
