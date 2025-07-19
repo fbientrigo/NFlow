@@ -1,5 +1,6 @@
 name: colab-env
 channels:
+  - pytorch
   - conda-forge
   - defaults
 dependencies:
@@ -10,5 +11,5 @@ dependencies:
   - pandas=2.2.2
   - seaborn=0.13.2
   - pip
-  - pip:
-    - torch==2.6.0+cu124 --extra-index-url https://download.pytorch.org/whl/cu124
+  - pytorch=2.1.0
+  - torchvision=0.15.2
