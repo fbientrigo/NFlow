@@ -223,6 +223,11 @@ class NormalizingFlow(nn.Module):
                 z, _ = layer(z, reverse=True)
         return z
 
+    def log_prob(self, x):
+        
+        z, log_det = self.forward(x)
+
+        return self.base_dist.log_prob(z) + log_det
 
 class MixturePrior(nn.Module):
     """
