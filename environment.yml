@@ -1,0 +1,15 @@
+name: colab-env
+channels:
+  - pytorch
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11
+  - scikit-learn=1.6.1
+  - optuna=4.4.0
+  - numpy=2.0.2
+  - pandas=2.2.2
+  - seaborn=0.13.2
+  - pip
+  - pytorch=2.1.0
+  - torchvision=0.15.2
