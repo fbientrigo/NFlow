@@ -66,7 +66,7 @@ def load_cached_data(cache_path: str):
     ...     cache_processed_data("cache.pt", data)
     """
     if os.path.exists(cache_path):
-        data = torch.load(cache_path)
+        data = torch.load(cache_path, weights_only=False) # changed to weights_only as 0
         logger.info(f"Loaded cached data from: {cache_path}")
         return data
     else:
