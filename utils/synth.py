@@ -117,7 +117,8 @@ def prepare_guided_dataloaders(path_lvl1: str,
                                q_pt: float = 0.8,
                                test_size: float = 0.2,
                                random_state: int = 42,
-                               plotdir: str = None):
+                               plotdir: str = None,
+                               scaler_mother: QuantileTransformer = QuantileTransformer()):
     """
     Loads data from lvl1
     1) Carga datos nivel1 desde HDF5.
@@ -129,7 +130,7 @@ def prepare_guided_dataloaders(path_lvl1: str,
     data = open_hdf(inpath=path_lvl1, key="mothers_data")
 
     # Scaling
-    scaled, scaler, _ = scale_muon_data(data, plotdir=plotdir)
+    scaled, scaler, _ = scale_muon_data(data, plotdir, scaler_mother)
 
     # lvl 2 mask
     mask = create_lvl2_mask(data, q_pz=q_pz, q_pt=q_pt)
