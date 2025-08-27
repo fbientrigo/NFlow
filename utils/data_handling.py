@@ -15,7 +15,7 @@ import h5py
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
-from sklearn.preprocessing import QuantileTransformer
+from sklearn.preprocessing import QuantileTransformerk, MinMaxScaler
 from torch.utils.data import TensorDataset
 
 logger = logging.getLogger(__name__)
@@ -197,7 +197,7 @@ def compute_angles(px, py, pz, handle_zero: bool = True):
 
 def scale_muon_data(mothers_df: np.ndarray,
                     plotdir: str,
-                    scaler_mother: QuantileTransformer):
+                    scaler_mother: MinMaxScaler):
     """
     Compute energy, apply scaling to muon features, and save diagnostic plots.
 

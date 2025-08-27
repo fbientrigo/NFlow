@@ -175,3 +175,7 @@ def _plot_angular_histogram(data_true, data_gen, bins, range_, label, output_nam
     if verbose:
         logger.info(f"Saved angular histogram: {plot_path}")
     return
+
+
+# ---- For logging ----
+

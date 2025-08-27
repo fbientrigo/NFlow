@@ -48,7 +48,7 @@ class LogitTransform(nn.Module):
         eps = self.eps
         B = x.size(0)
         if not reverse:
-            x = torch.clamp(x, 0.0, 1.0)
+            x = torch.clamp(x, min=self.eps, max=1.0 - self.eps) # added correction of clamping before 0827
             x_s = x * (1.0 - 2.0 * eps) + eps  # (ε, 1-ε)
             y = torch.log(x_s) - torch.log1p(-x_s)  # logit
             # log|det J|
@@ -166,7 +166,7 @@ class NormalizingFlow(nn.Module):
             layers.append(Permute(input_dim))
         self.layers = nn.ModuleList(layers)
 
-        self._base_dist = None  # lazily created on the right device
+        self._base_dist = None 
 
     # ---- base distribution management ----
     def ensure_base_dist(self, device: torch.device):

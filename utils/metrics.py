@@ -20,3 +20,6 @@ def plot_qq(real, gen, name):
     plt.plot([m,M],[m,M],'k--')
     plt.xlabel('Real quantiles'); plt.ylabel('Gen quantiles')
     plt.title(f'Q–Q {name}'); plt.tight_layout(); plt.show()
+
+
+
