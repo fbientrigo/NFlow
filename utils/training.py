@@ -293,7 +293,7 @@ def train_model_modular(model: nn.Module,
             loss.backward()
             optimizer.step()
 
-            tr_sum += float(loss)
+            tr_sum += float(loss.detach())
             for k, v in parts.items():
                 tr_parts_acc[k] += float(v)
 

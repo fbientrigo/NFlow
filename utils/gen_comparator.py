@@ -33,13 +33,12 @@ def ks_1d(x: np.ndarray, y: np.ndarray) -> float:
       complete routine (e.g., SciPy or a custom pooled-ECDF implementation).
     - This function is intended for quick, visual/diagnostic comparisons.
     """
-    x = np.sort(x.ravel()); y = np.sort(y.ravel())
-    nx, ny = len(x), len(y)
-    m = min(nx, ny)
-    Fx = (np.arange(1, m+1)) / nx
-    Fy = (np.arange(1, m+1)) / ny
+    x = np.asarray(x).ravel(); y = np.asarray(y).ravel()
+    xs = np.sort(x); ys = np.sort(y)
+    grid = np.concatenate([xs, ys])
+    Fx = np.searchsorted(xs, grid, side="right") / xs.size  # ECDF right-continuous
+    Fy = np.searchsorted(ys, grid, side="right") / ys.size
     return float(np.max(np.abs(Fx - Fy)))
-
 
 def fd_bins(a: np.ndarray, min_bins=20, max_bins=80) -> int:
     """
