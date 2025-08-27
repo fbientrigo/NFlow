@@ -15,7 +15,7 @@ import h5py
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
-from sklearn.preprocessing import QuantileTransformerk, MinMaxScaler
+from sklearn.preprocessing import QuantileTransformer, MinMaxScaler
 from torch.utils.data import TensorDataset
 
 logger = logging.getLogger(__name__)
