@@ -98,7 +98,7 @@ class GuidedLoss(LossBase):
                    if self.cfg.lambda2_schedule is not None
                    else (self.cfg.lambda2 if self.cfg.lambda2 is not None else 0.0))
 
-        return loss_global + self.cfg.lambda1 * loss_not2 + lambda2 * loss_2
+        return self.cfg.lambda1 * loss_not2 + lambda2 * loss_2
 
 class CorrLoss(LossBase):
     """Correlation-structure matching between model samples and data.
