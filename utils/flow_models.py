@@ -40,7 +40,7 @@ class LogitTransform(nn.Module):
       dy/dx = (1-2ε) / (x_s * (1 - x_s))
     so log|det J| = Σ [ log(1-2ε) - log(x_s) - log(1 - x_s) ].
     """
-    def __init__(self, eps: float = 1e-6):
+    def __init__(self, eps: float = 1e-5):
         super().__init__()
         self.eps = float(eps)
 
@@ -61,7 +61,7 @@ class LogitTransform(nn.Module):
         else:
             s = torch.sigmoid(x)                 # (0,1)
             x = (s - eps) / (1.0 - 2.0 * eps)    # back to [0,1]
-            x = torch.clamp(x, 0.0, 1.0)
+            x = torch.clamp(x, min=self.eps, max=1.0 - self.eps) # <---- clamping
             return x, torch.zeros(B, device=x.device)
 
 
