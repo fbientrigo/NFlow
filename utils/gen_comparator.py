@@ -118,7 +118,7 @@ def prange(a: np.ndarray, b: np.ndarray, qlo=0.01, qhi=0.99):
 
 
 def inverse_scale(t: torch.Tensor, scaler_mother : MinMaxScaler = MinMaxScaler()) -> torch.Tensor:
-    if 'scaler_mother' in globals() and scaler_mother is not None:
+    if scaler_mother is not None:
         return scaler_mother.inverse_transform(t.detach().cpu().numpy())
     else:
         return t.detach().cpu().numpy()

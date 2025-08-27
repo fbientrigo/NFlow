@@ -197,7 +197,7 @@ def compute_angles(px, py, pz, handle_zero: bool = True):
 
 def scale_muon_data(mothers_df: np.ndarray,
                     plotdir: str,
-                    scaler_mother: MinMaxScaler):
+                    scaler_mother: QuantileTransformer):
     """
     Compute energy, apply scaling to muon features, and save diagnostic plots.
 
