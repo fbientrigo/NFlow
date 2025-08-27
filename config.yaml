@@ -1,25 +1,49 @@
-# General settings
+# General
 run_base_dir: outputs
 device: "cuda"
-batch_size: 32
+batch_size: 2048
 
-# Data settings
-datapath_mothers: "/path/to/muonsGAN_data_afterMS.h5"
+# Data
+datapath_mothers: "mom_lvl1.h5"   # <-- ajusta a tu ruta real de entrada
 data:
-  train_ratio: 0.8
   val_ratio: 0.2
+  q_pz: 0.8
+  q_pt: 0.8
 
-# Model settings
+# Model
 model:
   name: "RealNVP_Flow"
-  hidden_dim: 160
-  n_layers: 10
-  learning_rate: 0.0004
-  epochs: 300
-  patience: 34
-  weight_decay: 6.3e-07
+  hidden_dim: 200
+  n_layers: 20
 
-# Logging settings
+# Training
+training:
+  learning_rate: 0.00004
+  epochs: 300
+  patience: 10
+  weight_decay: 0.0
+  # Modular loss
+  loss_keys: "NGCJ"
+  loss_weights: { N: 0.55, G: 0.20, C: 0.15, J: 0.10 }
+  loss_cfg:
+    G:
+      sigma1: 1.0
+      sigma2: 0.35
+      lambda1: 0.10
+      lambda2: 0.30
+    J:
+      alpha: 1.0e-3
+      beta:  1.0e-3
+  # Optional scheduler for G.lambda2 (will cap at max_v)
+  schedulers:
+    lambda2: "cosine_hold"
+  scheduler_cfg:
+    lambda2:
+      max_v: 0.7
+      warmup_frac: 0.5
+      start_frac: 0.2
+
+# Logging
 logging:
   level: "INFO"
   file: "logs/project.log"

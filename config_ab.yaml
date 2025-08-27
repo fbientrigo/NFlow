@@ -1,0 +1,59 @@
+# General
+run_base_dir: outputs_ab
+device: "cuda"
+batch_size: 2048
+
+# Data
+datapath_mothers: "mom_lvl1.h5"   # <-- ajusta
+data:
+  val_ratio: 0.2
+  q_pz: 0.8
+  q_pt: 0.8
+
+# Model template (reutilizado para todos los experimentos)
+model:
+  name: "RealNVP_Flow"
+  hidden_dim: 200
+  n_layers: 20
+
+# Train hyperparams (aplicados a cada combo)
+training:
+  learning_rate: 0.00004
+  epochs: 60
+  patience: 8
+  weight_decay: 0.0
+
+# A/B space (lista de combos; grids sencillos dentro de cada subpérdida)
+ab:
+  combos:
+    - keys: "N"
+
+    - keys: "NG"
+      G:
+        sigma1: 1.0
+        lambda1: 0.5
+        lambda2: 0.7
+        # grid para barrer algunos hiperparámetros
+        grid:
+          sigma2: [0.30, 0.35]
+          lambda2: [0.5, 0.7]
+
+    - keys: "NC"
+      C:
+        n_samples: 1024
+
+    - keys: "NGC"
+      G:
+        sigma1: 1.0
+        lambda1: 0.5
+        lambda2: 0.7
+        grid:
+          sigma2: [0.30, 0.35]
+          lambda2: [0.5, 0.7]
+      C:
+        n_samples: 1024
+
+# Logging
+logging:
+  level: "INFO"
+  file: "logs/abtest.log"
