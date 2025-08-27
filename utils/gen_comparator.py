@@ -124,6 +124,15 @@ def inverse_scale(t: torch.Tensor, scaler_mother : MinMaxScaler = MinMaxScaler()
         return t.detach().cpu().numpy()
 
 
+def numerical_comparison(val_real, gen_real, feat_names=['px','py','pz','energy']):
+    N, D = val_real.shape
+    feat_idx = list(range(min(4, D)))
+    # Numerical Comparison Results
+    for i, name in zip(feat_idx, feat_names):
+        r = val_real[:, i]; g = gen_real[:, i]
+    print(f"{name:>6s} | μ_real={np.mean(r):+.3e} μ_gen={np.mean(g):+.3e} | σ_real={np.std(r):.3e} σ_gen={np.std(g):.3e} | KS={ks_1d(r,g):.3f}")
+
+
 def plot_comparison(val_real, gen_real, feat_names=['px','py','pz','energy'], rows=2, cols=2):
     """
     Plot a side by side comparison between generated and real data.
@@ -148,14 +157,10 @@ def plot_comparison(val_real, gen_real, feat_names=['px','py','pz','energy'], ro
         ax.hist(g, bins=bins, range=rng, density=True, alpha=0.45, label='Gen')
         mu_r, mu_g = np.mean(r), np.mean(g)
         sd_r, sd_g = np.std(r),  np.std(g)
-        ax.set_title(f"{name} | KS={ks:.3f} | μΔ={mu_g-mu_r:+.2e} | σ×={sd_g/(sd_r+1e-12):.2f}")
+        ax.set_title(f"{name} | KS={ks:.3e} | μΔ={mu_g-mu_r:+.2e} | σ×={sd_g/(sd_r+1e-12):.2e}")
         ax.grid(True, alpha=0.25)
         ax.set_xlabel(name); ax.set_ylabel("Density")
 
     axes[0].legend(frameon=False)
     plt.show()
 
-    # --- resumen numérico mínimo (para logs) ---
-    for i, name in zip(feat_idx, feat_names):
-        r = val_real[:, i]; g = gen_real[:, i]
-    print(f"{name:>6s} | μ_real={np.mean(r):+.3e} μ_gen={np.mean(g):+.3e} | σ_real={np.std(r):.3e} σ_gen={np.std(g):.3e} | KS={ks_1d(r,g):.3f}")

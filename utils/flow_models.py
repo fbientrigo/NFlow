@@ -1,19 +1,16 @@
 """
 flow_models.py
 
-RealNVP normalizing flow layers with an optional bounded-data bijector
-and a learnable Gaussian Mixture prior.
+RealNVP normalizing flow layers (no bounded-data bijector) and an optional
+Gaussian Mixture prior for guided use-cases.
 
-Changes vs. previous version:
-- NEW `LogitTransform` bijector to map data in [0,1]^D <-> R^D (with epsilon).
-- `NormalizingFlow` can enable the bijector via `bounded_data=True` and `epsilon`.
-  * Ensures samples from `inverse()` live in [0,1] (up to ±eps) and fixes support mismatch.
-- Homogeneous layer interfaces: all layers return `(x, log_det)` in both directions.
-- `NormalizingFlow` now manages a cached `base_dist` on the correct device via
-  `ensure_base_dist(device)` and uses tensor-shaped `log_det` accumulators.
-
-This file is self‑contained to avoid extra imports, but `LogitTransform` can be
-moved to `utils/bijectors.py` later with no other code changes.
+Changes vs previous variant:
+- Removed LogitTransform and any `bounded_data` paths to keep the model tidy.
+- Homogeneous layer interface: `forward(x, reverse=False) -> (y, log_det)`
+  and same signature in reverse.
+- `NormalizingFlow` manages the base distribution on the correct device via
+  `ensure_base_dist` and uses tensor-shaped log-det accumulators.
+- Colab-friendly, no extra dependencies.
 """
 from __future__ import annotations
 
@@ -28,51 +25,13 @@ logger = logging.getLogger(__name__)
 torch.manual_seed(42)
 
 # ---------------------------------------------------------------------------
-# Bijectors
-# ---------------------------------------------------------------------------
-class LogitTransform(nn.Module):
-    """Bijector for data bounded in [0,1]^D.
-
-    forward(x):   x∈[0,1] -> y∈R, returns (y, sum_log_det)
-    inverse(y):   y∈R     -> x∈[0,1], returns (x, zeros)
-
-    We scale x to (ε, 1-ε) before the logit; the Jacobian per dim is
-      dy/dx = (1-2ε) / (x_s * (1 - x_s))
-    so log|det J| = Σ [ log(1-2ε) - log(x_s) - log(1 - x_s) ].
-    """
-    def __init__(self, eps: float = 1e-5):
-        super().__init__()
-        self.eps = float(eps)
-
-    def forward(self, x: torch.Tensor, reverse: bool = False):
-        eps = self.eps
-        B = x.size(0)
-        if not reverse:
-            x = torch.clamp(x, min=self.eps, max=1.0 - self.eps) # added correction of clamping before 0827
-            x_s = x * (1.0 - 2.0 * eps) + eps  # (ε, 1-ε)
-            y = torch.log(x_s) - torch.log1p(-x_s)  # logit
-            # log|det J|
-            sum_log_det = (
-                torch.log(torch.tensor(1.0 - 2.0 * eps, device=x.device))
-                - torch.log(x_s)
-                - torch.log1p(-x_s)
-            ).sum(dim=1)
-            return y, sum_log_det
-        else:
-            s = torch.sigmoid(x)                 # (0,1)
-            x = (s - eps) / (1.0 - 2.0 * eps)    # back to [0,1]
-            x = torch.clamp(x, min=self.eps, max=1.0 - self.eps) # <---- clamping
-            return x, torch.zeros(B, device=x.device)
-
-
-# ---------------------------------------------------------------------------
 # RealNVP blocks
 # ---------------------------------------------------------------------------
 class CouplingLayer(nn.Module):
     """Affine coupling (RealNVP).
 
-    Splits input into (x1, x2), applies x2' = x2 * exp(s(x1)) + t(x1),
-    and returns `(x_out, log_det)` in both directions.
+    Splits input into (x1, x2), applies x2' = x2 * exp(s(x1)) + t(x1).
+    Returns `(x_out, log_det)` in both directions.
     """
     def __init__(self, input_dim: int, hidden_dim: int, init_zero: bool = True):
         super().__init__()
@@ -84,7 +43,7 @@ class CouplingLayer(nn.Module):
             nn.Linear(self.n1, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, self.n2),
-            nn.Tanh(),  # bound log-scale to avoid explosion early on
+            nn.Tanh(),  # bounds log-scale for early stability
         )
         self.translate_net = nn.Sequential(
             nn.Linear(self.n1, hidden_dim),
@@ -92,7 +51,6 @@ class CouplingLayer(nn.Module):
             nn.Linear(hidden_dim, self.n2),
         )
         if init_zero:
-            # last Linear before Tanh in scale_net is index -2
             nn.init.zeros_(self.scale_net[-2].weight)
             nn.init.zeros_(self.scale_net[-2].bias)
             nn.init.zeros_(self.translate_net[-1].weight)
@@ -113,7 +71,7 @@ class CouplingLayer(nn.Module):
 
 
 class Permute(nn.Module):
-    """Feature permutation; returns (x, 0) in both directions."""
+    """Feature permutation; returns `(x, 0)` in both directions."""
     def __init__(self, num_features: int):
         super().__init__()
         perm = torch.randperm(num_features)
@@ -128,7 +86,7 @@ class Permute(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Flow + optional bounded-data wrapper
+# Flow (no bijector)
 # ---------------------------------------------------------------------------
 @dataclass
 class FlowConfig:
@@ -136,29 +94,21 @@ class FlowConfig:
     hidden_dim: int
     n_layers: int
     init_zero: bool = True
-    bounded_data: bool = True
-    epsilon: float = 1e-6
 
 
 class NormalizingFlow(nn.Module):
-    """RealNVP flow with optional [0,1]^D support via `LogitTransform`.
+    """Plain RealNVP (no bounded-data wrapper).
 
     Args:
         input_dim: data dimensionality
         hidden_dim: hidden units for s/t MLPs
-        n_layers: number of coupling-permute blocks
-        init_zero: initialize last layers to zero (near-identity start)
-        bounded_data: if True, prepend/append Logit/Sigmoid bijector
-        epsilon: ε used by the logit bijector
+        n_layers: number of coupling+permute blocks
+        init_zero: near-identity start for stability
     """
     def __init__(self, input_dim: int, hidden_dim: int, n_layers: int,
-                 init_zero: bool = True, bounded_data: bool = True, epsilon: float = 1e-6):
+                 init_zero: bool = True):
         super().__init__()
         self.input_dim = int(input_dim)
-        self.bounded_data = bool(bounded_data)
-        self.epsilon = float(epsilon)
-
-        self.pre_bijector = LogitTransform(self.epsilon) if self.bounded_data else None
 
         layers = []
         for _ in range(n_layers):
@@ -166,7 +116,7 @@ class NormalizingFlow(nn.Module):
             layers.append(Permute(input_dim))
         self.layers = nn.ModuleList(layers)
 
-        self._base_dist = None 
+        self._base_dist = None  # lazily created on the right device
 
     # ---- base distribution management ----
     def ensure_base_dist(self, device: torch.device):
@@ -181,22 +131,15 @@ class NormalizingFlow(nn.Module):
         """Data → latent: returns (z, total_log_det)."""
         B = x.size(0)
         total_ld = torch.zeros(B, device=x.device)
-        # bounded-data pre-bijector
-        if self.pre_bijector is not None:
-            x, ld = self.pre_bijector(x, reverse=False)
-            total_ld = total_ld + ld
-        # flow
         for layer in self.layers:
             x, ld = layer(x, reverse=False)
             total_ld = total_ld + ld
         return x, total_ld
 
     def inverse(self, z: torch.Tensor):
-        """Latent → data: applies inverse flow and optional sigmoid."""
+        """Latent → data."""
         for layer in reversed(self.layers):
             z, _ = layer(z, reverse=True)
-        if self.pre_bijector is not None:
-            z, _ = self.pre_bijector(z, reverse=True)  # into [0,1]
         return z
 
     # ---- densities & sampling ----
@@ -206,18 +149,20 @@ class NormalizingFlow(nn.Module):
         return self._base_dist.log_prob(z) + total_ld
 
     @torch.no_grad()
-    def sample(self, n: int, device: torch.device | None = None) -> torch.Tensor:
+    def sample(self, n: int, device: torch.device | None = None, temperature: float = 1.0) -> torch.Tensor:
         device = device or next(self.parameters()).device
         self.ensure_base_dist(device)
         z = self._base_dist.sample((n,))
+        if temperature != 1.0:
+            z = z * float(temperature)
         return self.inverse(z)
 
 
 # ---------------------------------------------------------------------------
-# Learnable GMM prior (for guided or hybrid losses)
+# Optional GMM prior (for guided uses)
 # ---------------------------------------------------------------------------
 class MixturePrior(nn.Module):
-    """Diagonal-covariance mixture of Gaussians in latent space."""
+    """Diagonal-covariance Gaussian mixture in latent space."""
     def __init__(self, latent_dim: int, K: int = 2):
         super().__init__()
         self.K = K

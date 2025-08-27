@@ -1,155 +1,435 @@
 # training.py
 
 """
-Training utilities for RealNVP flows with a learnable Gaussian Mixture prior.
+Training utilities for RealNVP flows with modular, composable losses.
 
-This module provides:
-- GuidedFlowLoss: a semi-supervised loss combining global NLL with class-specific components.
-- FlowNLL: a standard negative log-likelihood loss wrapper.
-- collect_latents: extract latent representations from a trained flow.
-- plot_latent_dims: visualize marginal histograms of each latent dimension.
-- latent_metrics: compute silhouette score and Mahalanobis distance between components.
-- train_model: a flexible training loop supporting NLL or guided loss, LR scheduling, early stopping, pruning, and inline diagnostics.
+What is new here
+----------------
+- Loss registry includes: N (NLL), G (Guided), C (Corr), J (Jacobian regularizer).
+- `build_combined_loss` returns a composite with attributes: `.mods`, `.w`, `.ids`.
+- **Per‑component loss breakdown**: helper `compute_loss_and_parts(...)` to get
+  total + parts (e.g., {'N': ..., 'G': ..., 'C': ..., 'J': ...}).
+- Training loop `train_model_modular(...)` now logs **per‑loss curves** to TB and
+  also returns (optionally) a `history` dict with epochwise totals & parts.
+- Lightweight Jacobian‐of‐flow stats (mean/std) are logged each epoch.
+- Utilities to collect / plot latent metrics remain compatible.
+
+This file is Colab‑friendly: no extra dependencies beyond PyTorch/Matplotlib.
 """
 
+from __future__ import annotations
+
 import math
-import torch
-import torch.optim as optim
-import torch.nn as nn
 import logging
-import optuna
-from IPython.display import clear_output
+from dataclasses import dataclass
+from typing import Dict, Optional, Iterable, Tuple, Callable, List
+from collections import defaultdict
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
 import matplotlib.pyplot as plt
-from sklearn.metrics import silhouette_score
+from sklearn.metrics import silhouette_score  # optional
 
 logger = logging.getLogger(__name__)
 
-
-class GuidedFlowLoss(nn.Module):
+# ----------------------------
+# Loss Interfaces & Registry
+# ----------------------------
+class LossBase(nn.Module):
+    """All losses implement forward(batch: dict, model: nn.Module, epoch: int, epochs_tot: int) -> Tensor
+    batch MUST contain at least: {'x': Tensor[B, D]}. Optionally: 'mask' (Tensor[B]).
     """
-    Combined loss for guided training of a flow with a GMM prior.
+    def forward(self, batch: Dict[str, torch.Tensor], model: nn.Module, epoch: int, epochs_tot: int) -> torch.Tensor:  # type: ignore[override]
+        raise NotImplementedError
 
-    This loss consists of:
-      1) Global negative log-likelihood under the GMM prior.
-      2) A sub-loss for "lvl1" samples pushing them toward component 0 (mean mu[0], std σ1).
-      3) A sub-loss for "lvl2" samples pushing them toward component 1 (mean mu[1], std σ2).
+class NLLLoss(LossBase):
+    """Standard negative log-likelihood: -E[log p(x)]."""
+    def forward(self, batch: Dict[str, torch.Tensor], model: nn.Module, epoch: int, epochs_tot: int) -> torch.Tensor:
+        x = batch['x']
+        return -model.log_prob(x).mean()
 
-    Parameters
-    ----------
-    flow : nn.Module
-        Invertible flow model with methods `forward(x)` returning (z, logdet).
-    prior : nn.Module
-        MixturePrior defining `log_prob(z)` and `mu` parameters.
-    λ1 : float
-        Weight for the lvl1 sub-loss.
-    σ1 : float
-        Standard deviation used when computing log-prob for component 0.
-    λ2 : float
-        Weight for the lvl2 sub-loss.
-    σ2 : float
-        Standard deviation used when computing log-prob for component 1.
+@dataclass
+class GuidedCfg:
+    sigma1: float
+    sigma2: float
+    lambda1: float
+    lambda2: Optional[float] = None
+    lambda2_schedule: Optional[Callable[[int, int], float]] = None
+
+class GuidedLoss(LossBase):
+    """Guided loss (N/G style):
+      total = NLL_global + lambda1 * E_{~mask}(l1) + lambda2 * E_{mask}(l2)
+      where l1 = -log N(0, sigma1^2 I)(z), l2 = -log N(0, sigma2^2 I)(z)
+      with z, log_det = model.forward(x)
     """
-    def __init__(self, flow, prior, λ1, σ1, λ2, σ2):
+    def __init__(self, cfg: GuidedCfg):
         super().__init__()
-        self.flow = flow
-        self.prior = prior
-        self.λ1 = λ1
-        self.σ1 = σ1
-        self.λ2 = λ2
-        self.σ2 = σ2
+        self.cfg = cfg
 
-    def forward(self, x, mask_lvl2):
-        """
-        Compute the guided flow loss.
+    def forward(self, batch: Dict[str, torch.Tensor], model: nn.Module, epoch: int, epochs_tot: int) -> torch.Tensor:
+        x = batch['x']
+        mask = batch.get('mask', None)
+        # Global NLL over the whole batch
+        loss_global = -model.log_prob(x).mean()
 
-        Parameters
-        ----------
-        x : torch.Tensor of shape (batch_size, input_dim)
-            Input data batch.
-        mask_lvl2 : torch.BoolTensor of shape (batch_size,)
-            Boolean mask indicating which samples belong to lvl2.
+        # z for guided terms
+        z, _ = model.forward(x)
+        # log N(z; 0, sigma^2 I) = sum_i [ -0.5*log(2πσ^2) - z_i^2/(2σ^2) ]
+        def neg_log_gauss(z, sigma):
+            return -torch.distributions.Normal(0.0, sigma).log_prob(z).sum(dim=1)
 
-        Returns
-        -------
-        loss : torch.Tensor, scalar
-            The combined loss value.
-        """
-        z, logdet = self.flow.forward(x)
+        l1 = neg_log_gauss(z, self.cfg.sigma1)
+        l2 = neg_log_gauss(z, self.cfg.sigma2)
 
-        # 1) Global NLL term
-        nll_global = - (self.prior.log_prob(z) + logdet).mean()
+        if mask is None:
+            logger.warning("GuidedLoss: mask not provided; guided terms reduce to global")
+            return loss_global
 
-        # 2) Log-probabilities under each component Gaussian
-        dist0 = torch.distributions.Normal(self.prior.mu[0], self.σ1)
-        dist1 = torch.distributions.Normal(self.prior.mu[1], self.σ2)
-        lp0 = dist0.log_prob(z).sum(dim=1)
-        lp1 = dist1.log_prob(z).sum(dim=1)
+        mask = mask.bool()
+        not_mask = ~mask
+        if mask.sum() == 0 or not_mask.sum() == 0:
+            logger.warning("GuidedLoss: level-2 subset empty at epoch %d", epoch)
 
-        # 3) Sub-losses for each class
-        loss0 = -(lp0[~mask_lvl2].mean()) if (~mask_lvl2).any() else torch.tensor(0., device=z.device)
-        loss1 = -(lp1[ mask_lvl2].mean()) if ( mask_lvl2).any() else torch.tensor(0., device=z.device)
+        loss_not2 = l1[not_mask].mean() if not_mask.any() else z.new_tensor(0.0)
+        loss_2    = l2[mask].mean()     if mask.any()     else z.new_tensor(0.0)
 
-        return nll_global + self.λ1 * loss0 + self.λ2 * loss1
+        lambda2 = (self.cfg.lambda2_schedule(epoch, epochs_tot)
+                   if self.cfg.lambda2_schedule is not None
+                   else (self.cfg.lambda2 if self.cfg.lambda2 is not None else 0.0))
 
+        return loss_global + self.cfg.lambda1 * loss_not2 + lambda2 * loss_2
 
-class FlowNLL(nn.Module):
+class CorrLoss(LossBase):
+    """Correlation-structure matching between model samples and data.
+    Penalizes mean squared difference between correlation matrices.
     """
-    Negative log-likelihood loss wrapper for any prior with a `log_prob(z)` method.
-
-    Parameters
-    ----------
-    flow : nn.Module
-        Invertible flow model with methods `forward(x)` returning (z, logdet).
-    prior : nn.Module
-        Prior distribution with method `log_prob(z)`.
-    """
-    def __init__(self, flow, prior):
+    def __init__(self, n_samples: Optional[int] = None):
         super().__init__()
-        self.flow = flow
-        self.prior = prior
+        self.n_samples = n_samples
 
-    def forward(self, x):
-        """
-        Compute the NLL loss.
+    def _corr(self, x: torch.Tensor) -> torch.Tensor:
+        x = x - x.mean(dim=0, keepdim=True)
+        x = x / (x.std(dim=0, keepdim=True) + 1e-8)
+        return (x.T @ x) / (x.shape[0] - 1)
 
-        Parameters
-        ----------
-        x : torch.Tensor of shape (batch_size, input_dim)
-            Input data batch.
+    def forward(self, batch: Dict[str, torch.Tensor], model: nn.Module, epoch: int, epochs_tot: int) -> torch.Tensor:
+        x = batch['x']
+        n = self.n_samples or x.shape[0]
+        with torch.no_grad():
+            xs = model.sample(n)
+        c_pred = self._corr(xs)
+        c_true = self._corr(x)
+        return torch.mean((c_pred - c_true) ** 2)
 
-        Returns
-        -------
-        loss : torch.Tensor, scalar
-            The mean negative log-likelihood over the batch.
-        """
-        z, logdet = self.flow.forward(x)
-        return - (self.prior.log_prob(z) + logdet).mean()
+class JacRegLoss(LossBase):
+    """Penaliza magnitud/varianza del log-det del flow (excluye el bijector)."""
+    def __init__(self, alpha: float = 1e-3, beta: float = 1e-3):
+        super().__init__()
+        self.alpha = float(alpha)
+        self.beta  = float(beta)
 
+    def forward(self, batch, model, epoch, epochs_tot):
+        x = batch['x']
+        z, tot_ld = model.forward(x)  # incluye bijector + flow
+        # sustrae LD del bijector (mismo eps que el modelo)
+        eps = getattr(model, "epsilon", 1e-6)
+        x_cl = x.clamp(0, 1)
+        xs = x_cl * (1 - 2*eps) + eps
+        ld_bij = ( torch.log(torch.tensor(1 - 2*eps, device=x.device))
+                   - torch.log(xs) - torch.log1p(-xs) ).sum(dim=1)
+        ld_flow = tot_ld - ld_bij
+        return self.alpha * ld_flow.pow(2).mean() + self.beta * ld_flow.var(unbiased=False)
+
+# Registry of available losses (extend here for more A/B variants)
+LOSS_REGISTRY: Dict[str, Callable[..., LossBase]] = {
+    'N': lambda **kw: NLLLoss(),
+    'G': lambda **kw: GuidedLoss(GuidedCfg(**kw)),
+    'C': lambda **kw: CorrLoss(**kw),
+    'J': lambda **kw: JacRegLoss(**kw)
+}
+
+
+def build_combined_loss(keys: str,
+                        weights: Optional[Dict[str, float]] = None,
+                        per_loss_cfg: Optional[Dict[str, dict]] = None) -> LossBase:
+    """Build a combined loss from a string like 'NGC'.
+
+    Returns a module with attributes `.mods` (sub‑losses), `.w` (weights), `.ids` (keys).
+    """
+    per_loss_cfg = per_loss_cfg or {}
+    ks = list(keys)
+    if weights is None:
+        weights = {k: 1.0 / max(1, len(ks)) for k in ks}
+
+    modules = nn.ModuleList()
+    ws: List[float] = []
+    ids: List[str] = []
+    for k in ks:
+        if k not in LOSS_REGISTRY:
+            raise KeyError(f"Unknown loss key '{k}'. Available: {list(LOSS_REGISTRY)}")
+        cfg = per_loss_cfg.get(k, {})
+        lf = LOSS_REGISTRY[k](**cfg)
+        modules.append(lf)
+        ws.append(float(weights[k]))
+        ids.append(k)
+
+    class _Combined(LossBase):
+        def __init__(self, mods: nn.ModuleList, w: List[float], ids: List[str]):
+            super().__init__()
+            self.mods = mods
+            self.w = w
+            self.ids = ids
+        def forward(self, batch: Dict[str, torch.Tensor], model: nn.Module, epoch: int, epochs_tot: int) -> torch.Tensor:
+            total = 0.0
+            for w, lf in zip(self.w, self.mods):
+                total = total + w * lf(batch, model, epoch, epochs_tot)
+            return total
+
+    return _Combined(modules, ws, ids)
+
+# ----------------------------
+# Helpers: loss breakdown & LD stats
+# ----------------------------
+
+def compute_loss_and_parts(loss_fn: LossBase,
+                           batch: Dict[str, torch.Tensor],
+                           model: nn.Module,
+                           epoch: int,
+                           epochs_tot: int):
+    """Compute total loss and per‑component parts when available.
+    Returns (total_loss, parts_dict) where parts are **unweighted**: key -> Tensor.
+    Falls back to {} if `loss_fn` has no composite structure.
+    """
+    if hasattr(loss_fn, 'mods') and hasattr(loss_fn, 'w') and hasattr(loss_fn, 'ids'):
+        parts = {}
+        total = 0.0
+        for k, w, lf in zip(loss_fn.ids, loss_fn.w, loss_fn.mods):
+            li = lf(batch, model, epoch, epochs_tot)
+            parts[k] = li.detach()
+            total = total + w * li
+        return total, parts
+    # simple loss
+    total = loss_fn(batch, model, epoch, epochs_tot)
+    return total, {}
+
+
+def compute_ld_flow_stats(model: nn.Module, x: torch.Tensor, eps: float | None = None):
+    """Return mean/std of log‑det contributed by RealNVP layers (excludes bijector)."""
+    with torch.no_grad():
+        z, tot_ld = model.forward(x)
+        e = eps if eps is not None else getattr(model, "epsilon", 1e-6)
+        x_cl = x.clamp(0, 1)
+        xs = x_cl * (1 - 2*e) + e
+        ld_bij = ( torch.log(torch.tensor(1 - 2*e, device=x.device))
+                   - torch.log(xs) - torch.log1p(-xs) ).sum(dim=1)
+        ld_flow = tot_ld - ld_bij
+        return ld_flow.mean().item(), ld_flow.std().item()
+
+# ----------------------------
+# Training / Evaluation Loops
+# ----------------------------
+
+def _to_batch(x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
+    return {'x': x} if mask is None else {'x': x, 'mask': mask}
+
+
+def train_model_modular(model: nn.Module,
+                        train_loader: Iterable,
+                        val_loader: Iterable,
+                        epochs: int,
+                        lr: float,
+                        writer,  # may be None
+                        device: torch.device,
+                        model_dir: str,
+                        name_model: str,
+                        loss_keys: str = 'N',
+                        loss_weights: Optional[Dict[str, float]] = None,
+                        loss_cfg: Optional[Dict[str, dict]] = None,
+                        patience: int = 20,
+                        weight_decay: float = 0.0,
+                        trial=None,
+                        plot_every: int = 0,
+                        return_history: bool = False):
+    """Modular training with weighted, pluggable losses.
+
+    If `return_history=True`, returns `(model, history)` where `history` is a dict:
+      history = {
+        'train_total': [...], 'val_total': [...],
+        'train_parts': {key: [...]}, 'val_parts': {key: [...]},
+        'ld_flow_mean': [...], 'ld_flow_std': [...],
+      }
+    """
+    loss_fn = build_combined_loss(loss_keys, loss_weights, loss_cfg)
+
+    optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+    model.to(device)
+
+    best_val = float('inf')
+    epochs_no_improve = 0
+
+    hist = {
+        'train_total': [], 'val_total': [],
+        'train_parts': defaultdict(list), 'val_parts': defaultdict(list),
+        'ld_flow_mean': [], 'ld_flow_std': []
+    }
+
+    for epoch in range(1, epochs + 1):
+        # ---- Train ----
+        model.train()
+        tr_sum = 0.0
+        tr_parts_acc = defaultdict(float)
+        for batch in train_loader:
+            if isinstance(batch, (tuple, list)):
+                x, mask = batch
+                b = _to_batch(x.to(device), mask.to(device))
+            elif isinstance(batch, dict):
+                b = {k: v.to(device) for k, v in batch.items()}
+            else:
+                b = {'x': batch.to(device)}
+
+            optimizer.zero_grad()
+            loss, parts = compute_loss_and_parts(loss_fn, b, model, epoch, epochs)
+            loss.backward()
+            optimizer.step()
+
+            tr_sum += float(loss)
+            for k, v in parts.items():
+                tr_parts_acc[k] += float(v)
+
+        ntr = max(1, len(train_loader))
+        train_loss = tr_sum / ntr
+        hist['train_total'].append(train_loss)
+        for k in getattr(loss_fn, 'ids', []):
+            hist['train_parts'][k].append(tr_parts_acc.get(k, 0.0) / ntr)
+
+        # ---- Validation ----
+        model.eval()
+        vl_sum = 0.0
+        vl_parts_acc = defaultdict(float)
+        with torch.no_grad():
+            for batch in val_loader:
+                if isinstance(batch, (tuple, list)):
+                    x, mask = batch
+                    b = _to_batch(x.to(device), mask.to(device))
+                elif isinstance(batch, dict):
+                    b = {k: v.to(device) for k, v in batch.items()}
+                else:
+                    b = {'x': batch.to(device)}
+                vloss, vparts = compute_loss_and_parts(loss_fn, b, model, epoch, epochs)
+                vl_sum += float(vloss)
+                for k, v in vparts.items():
+                    vl_parts_acc[k] += float(v)
+        nvl = max(1, len(val_loader))
+        val_loss = vl_sum / nvl
+        hist['val_total'].append(val_loss)
+        for k in getattr(loss_fn, 'ids', []):
+            hist['val_parts'][k].append(vl_parts_acc.get(k, 0.0) / nvl)
+
+        # ---- Jacobian stats on a small validation batch ----
+        try:
+            xb = next(iter(val_loader))
+            x = xb[0].to(device) if isinstance(xb,(list,tuple)) else (xb['x'].to(device) if isinstance(xb,dict) else xb.to(device))
+            mu_ld, sd_ld = compute_ld_flow_stats(model, x)
+            hist['ld_flow_mean'].append(mu_ld)
+            hist['ld_flow_std'].append(sd_ld)
+        except Exception:
+            hist['ld_flow_mean'].append(float('nan'))
+            hist['ld_flow_std'].append(float('nan'))
+
+        logger.info(f"[{epoch}/{epochs}] Train: {train_loss:.4f}  Val: {val_loss:.4f}")
+        if writer is not None:
+            writer.add_scalars("Loss/Total", {"Train": train_loss, "Val": val_loss}, epoch)
+            for k in getattr(loss_fn, 'ids', []):
+                writer.add_scalars(f"Loss/{k}", {"Train": hist['train_parts'][k][-1], "Val": hist['val_parts'][k][-1]}, epoch)
+            writer.add_scalars("Jacobian/ld_flow", {"mean": hist['ld_flow_mean'][-1], "std": hist['ld_flow_std'][-1]}, epoch)
+
+        # Optuna pruning
+        if trial:
+            trial.report(val_loss, epoch)
+            if trial.should_prune():
+                raise optuna.TrialPruned()
+
+        # Early stopping & checkpoint
+        if val_loss < best_val - 1e-9:
+            best_val = val_loss
+            epochs_no_improve = 0
+            torch.save(model.state_dict(), f"{model_dir}/{name_model}.pt")
+        else:
+            epochs_no_improve += 1
+            if epochs_no_improve >= patience:
+                logger.info("Early stopping at epoch %d (best=%.4f)", epoch, best_val)
+                break
+
+        # Optional inline plot in notebooks
+        if plot_every and (epoch % plot_every == 0):
+            try:
+                plot_loss_history(hist, ids=getattr(loss_fn, 'ids', []))
+            except Exception:
+                pass
+
+    # Load best
+    model.load_state_dict(torch.load(f"{model_dir}/{name_model}.pt", map_location=device))
+    logger.info("Training complete. Best validation loss: %.4f", best_val)
+    if return_history:
+        return model, hist
+    return model
+
+# ----------------------------
+# Plot helpers
+# ----------------------------
+
+def plot_loss_history(history: Dict, ids: Iterable[str] = ()):  # simple, notebook-friendly
+    """Plot total Train/Val and each component's Train/Val curves."""
+    T = len(history['train_total'])
+    xs = list(range(1, T+1))
+    n_parts = len(list(ids))
+    rows = 1 + (1 if n_parts else 0) + (1)  # total + (parts) + (ld stats)
+    fig, axes = plt.subplots(rows, 1, figsize=(7, 3*rows), sharex=True)
+    if rows == 1:
+        axes = [axes]
+
+    # Total
+    ax = axes[0]
+    ax.plot(xs, history['train_total'], label='Train')
+    ax.plot(xs, history['val_total'],   label='Val')
+    ax.set_ylabel('Total loss'); ax.set_title('Total Loss'); ax.grid(True, alpha=0.3); ax.legend()
+
+    # Parts
+    if n_parts:
+        ax = axes[1]
+        for k in ids:
+            ax.plot(xs, history['train_parts'][k], label=f'Train {k}')
+            ax.plot(xs, history['val_parts'][k],   label=f'Val {k}', linestyle='--')
+        ax.set_ylabel('Loss parts'); ax.set_title('Per‑component losses'); ax.grid(True, alpha=0.3); ax.legend(ncol=max(1, n_parts))
+
+    # Jacobian stats
+    ax = axes[-1]
+    ax.plot(xs, history['ld_flow_mean'], label='ld_flow mean')
+    ax.plot(xs, history['ld_flow_std'],  label='ld_flow std')
+    ax.set_ylabel('LD stats'); ax.set_xlabel('Epoch'); ax.set_title('RealNVP log‑det (flow only)'); ax.grid(True, alpha=0.3); ax.legend()
+
+    plt.tight_layout(); plt.show()
+
+# ----------------------------
+# Latent helpers (unchanged API)
+# ----------------------------
 
 def collect_latents(model, loader, device):
-    """
-    Collect latent representations and masks from a data loader.
-
-    Parameters
-    ----------
-    model : nn.Module
-        Trained flow model with `forward(x)` → (z, logdet).
-    loader : DataLoader
-        Yields (x, mask_lvl2) tuples.
-    device : torch.device
-        Device on which to perform inference.
-
-    Returns
-    -------
-    zs : torch.Tensor of shape (n_samples, latent_dim)
-        Concatenated latent codes for all samples.
-    ys : torch.Tensor of shape (n_samples,)
-        Concatenated boolean masks for lvl2.
-    """
+    """Collect latent representations and masks from a data loader.
+    Returns (zs, ys)."""
     model.eval()
     zs, ys = [], []
     with torch.no_grad():
-        for x, y in loader:
+        for batch in loader:
+            if isinstance(batch, (tuple, list)):
+                x, y = batch
+            elif isinstance(batch, dict):
+                x, y = batch['x'], batch.get('mask', None)
+                if y is None:
+                    raise ValueError('loader dict must include a "mask" key for guided metrics')
+            else:
+                raise ValueError('loader must yield (x, mask) or dict with keys x/mask')
             x = x.to(device)
             z, _ = model.forward(x)
             zs.append(z.cpu())
@@ -158,18 +438,7 @@ def collect_latents(model, loader, device):
 
 
 def plot_latent_dims(zs, ys, prior):
-    """
-    Plot marginal histograms of each latent dimension, with component means.
-
-    Parameters
-    ----------
-    zs : array-like of shape (n_samples, latent_dim)
-        Latent codes, either ndarray or torch.Tensor.
-    ys : array-like of shape (n_samples,)
-        Boolean mask for lvl2 membership.
-    prior : MixturePrior
-        Prior containing `mu` (shape (K, latent_dim)) and `K`.
-    """
+    """Plot marginal histograms of each latent dimension, with component means."""
     if isinstance(zs, torch.Tensor):
         zs = zs.cpu().detach().numpy()
     if isinstance(ys, torch.Tensor):
@@ -186,225 +455,39 @@ def plot_latent_dims(zs, ys, prior):
         for k in range(prior.K):
             mu_ki = prior.mu[k, i].item()
             ax.axvline(mu_ki, linestyle='--', color=f'C{k}', label=f'μ_{k}, dim{i}')
-        ax.set_xlabel(f'z[{i}]')
-        ax.set_ylabel('Density')
-        ax.set_title(f'Latent Dimension #{i}')
+        ax.set_xlabel(f'z[{i}]'); ax.set_ylabel('Density'); ax.set_title(f'Latent Dimension #{i}')
         ax.legend(fontsize='small')
-    plt.tight_layout()
-    plt.show()
+    plt.tight_layout(); plt.show()
 
 
 def latent_metrics(zs, ys, prior):
-    """
-    Compute clustering quality metrics in latent space.
+    """Compute simple latent metrics (silhouette; Mahalanobis for K=2)."""
+    try:
 
-    Parameters
-    ----------
-    zs : torch.Tensor or ndarray of shape (n_samples, latent_dim)
-        Latent codes.
-    ys : torch.Tensor or ndarray of shape (n_samples,)
-        Boolean mask for lvl2 membership.
-    prior : MixturePrior
-        Prior with `mu` and `log_sig` parameters, and attribute `K`.
+        HAVE_SK = True
+    except Exception:
+        HAVE_SK = False
 
-    Returns
-    -------
-    sil : float
-        Silhouette score of the latent embeddings using `ys` as labels.
-    maha : float or None
-        Mahalanobis distance between the two component means if `K == 2`,
-        otherwise None.
-    """
-    labels = ys.numpy() if isinstance(ys, torch.Tensor) else ys
-    data   = zs.numpy() if isinstance(zs, torch.Tensor) else zs
-    sil = silhouette_score(data, labels)
+    if isinstance(ys, torch.Tensor):
+        labels = ys.numpy()
+    else:
+        labels = ys
+    if isinstance(zs, torch.Tensor):
+        data = zs.numpy()
+    else:
+        data = zs
+
+    sil = None
+    if HAVE_SK:
+        try:
+            sil = float(__import__('sklearn.metrics').metrics.silhouette_score(data, labels))
+        except Exception:
+            sil = None
 
     maha = None
-    if prior.K == 2:
+    if getattr(prior, 'K', 0) == 2:
         diff = (prior.mu[0] - prior.mu[1]).unsqueeze(0)
         cov = (prior.log_sig.exp()[0]**2 + prior.log_sig.exp()[1]**2).mean()
         maha = (diff.norm() / math.sqrt(cov)).item()
 
     return sil, maha
-
-
-def train_model(model,
-                train_loader,
-                val_loader,
-                prior,
-                epochs: int,
-                lr: float,
-                writer,
-                device,
-                model_dir: str,
-                name_model: str,
-                alpha: float = 0.5,
-                patience: int = 20,
-                weight_decay: float = 0.0,
-                trial=None,
-                mod_epochs: int = 10,
-                kind: str = 'nll',
-                hyperparams: dict = None):
-    """
-    Train a RealNVP flow model with a Gaussian Mixture prior.
-
-    This function supports both:
-      - Standard NLL training.
-      - Guided training combining global NLL and class-specific losses.
-
-    Parameters
-    ----------
-    model : nn.Module
-        The RealNVP flow model.
-    train_loader : DataLoader
-        Yields (x, mask_lvl2) for training.
-    val_loader : DataLoader
-        Yields (x, mask_lvl2) for validation.
-    prior : MixturePrior
-        Learnable mixture prior with `mu`, `log_sig`, `log_pi`.
-    epochs : int
-        Number of training epochs.
-    lr : float
-        Base learning rate for flow parameters.
-    writer : SummaryWriter
-        TensorBoard writer for logging.
-    device : torch.device
-        Device for computation.
-    model_dir : str
-        Directory to save model checkpoints.
-    name_model : str
-        Base filename for saved model.
-    alpha : float, default=0.5
-        Sampling proportion for component 1 in diagnostic plots.
-    patience : int, default=20
-        Early stopping patience (epochs without improvement).
-    weight_decay : float, default=0.0
-        L2 regularization coefficient.
-    trial : optuna.Trial, optional
-        Optuna trial for pruning (default: None).
-    mod_epochs : int, default=10
-        Interval (in epochs) for inline diagnostic plots.
-    kind : {'nll', 'guided'}, default='nll'
-        Loss mode: `'nll'` for FlowNLL, `'guided'` for GuidedFlowLoss.
-    hyperparams : dict, optional
-        Hyperparameters for guided loss (`lambda1`, `sigma1`, `lambda2`, `sigma2`).
-
-    Returns
-    -------
-    nn.Module
-        The model loaded with the best validation performance.
-
-    Notes
-    -----
-    - Uses `CosineAnnealingLR` to decay learning rate from `lr` to `lr * 1e-3`.
-    - Supports per-parameter learning rates: `prior.mu` uses `lr * 5`,
-      `prior.log_sig` and `prior.log_pi` use `lr * 0.5`.
-    - Early stopping monitors validation loss only.
-    - Integrates Optuna pruning if `trial` is provided.
-    """
-    model.to(device)
-    prior.to(device)
-
-    # Select loss function
-    if kind == 'nll':
-        loss_fn = FlowNLL(model, prior)
-    elif kind == 'guided':
-        hp = hyperparams or {}
-        loss_fn = GuidedFlowLoss(
-            model, prior,
-            hp['lambda1'], hp['sigma1'],
-            hp['lambda2'], hp['sigma2']
-        )
-    else:
-        raise ValueError(f"Unknown kind: {kind}")
-
-    # Optimizer with differential learning rates
-    optimizer = optim.Adam([
-        {'params': model.parameters(),               'lr': lr},
-        {'params': [prior.mu],                       'lr': lr * 5},
-        {'params': [prior.log_sig, prior.log_pi],    'lr': lr * 0.5},
-    ], weight_decay=weight_decay)
-
-    # Learning rate scheduler
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(
-        optimizer,
-        T_max=epochs,
-        eta_min=lr * 1e-3
-    )
-
-    best_val = float('inf')
-    epochs_no_improve = 0
-    train_losses, val_losses = [], []
-
-    for epoch in range(1, epochs + 1):
-        # —— Training phase ——
-        model.train()
-        prior.train()
-        for x, mask in train_loader:
-            x, mask = x.to(device), mask.to(device)
-            optimizer.zero_grad()
-            loss = loss_fn(x) if kind == 'nll' else loss_fn(x, mask)
-            loss.backward()
-            optimizer.step()
-
-        # —— Evaluate train loss in eval mode ——
-        model.eval()
-        prior.eval()
-        train_eval = 0.0
-        with torch.no_grad():
-            for x, mask in train_loader:
-                x, mask = x.to(device), mask.to(device)
-                train_eval += (loss_fn(x) if kind == 'nll' else loss_fn(x, mask)).item()
-        train_losses.append(train_eval / len(train_loader))
-
-        # —— Validation phase ——
-        running_val = 0.0
-        with torch.no_grad():
-            for x, mask in val_loader:
-                x, mask = x.to(device), mask.to(device)
-                running_val += (loss_fn(x) if kind == 'nll' else loss_fn(x, mask)).item()
-        val_losses.append(running_val / len(val_loader))
-
-        # Log metrics and learning rate
-        current_lr = scheduler.get_last_lr()[0]
-        writer.add_scalars("Loss", {"Train": train_losses[-1], "Val": val_losses[-1]}, epoch)
-        writer.add_scalar("LR", current_lr, epoch)
-        logger.info(f"[{epoch}/{epochs}] LR={current_lr:.2e}  "
-                    f"Train={train_losses[-1]:.4f}  Val={val_losses[-1]:.4f}")
-
-        # —— Inline diagnostics every mod_epochs —— 
-        if mod_epochs and epoch % mod_epochs == 0:
-            clear_output(wait=True)
-            # Plot loss curves
-            plt.plot(range(1, epoch + 1), train_losses, label="Train")
-            plt.plot(range(1, epoch + 1), val_losses,   label="Val")
-            plt.legend()
-            plt.grid(True)
-            plt.show()
-            # Additional diagnostic plots omitted for brevity
-
-        # —— Early stopping & checkpointing ——
-        if val_losses[-1] < best_val:
-            best_val = val_losses[-1]
-            epochs_no_improve = 0
-            torch.save(model.state_dict(), f"{model_dir}/{name_model}.pt")
-        else:
-            epochs_no_improve += 1
-            if epochs_no_improve >= patience:
-                logger.info(f"Early stopping at epoch {epoch}")
-                break
-
-        # Optuna pruning
-        if trial:
-            trial.report(val_losses[-1], epoch)
-            if trial.should_prune():
-                raise optuna.TrialPruned()
-
-        # Step the scheduler
-        scheduler.step()
-
-    # Load best model
-    model.load_state_dict(torch.load(f"{model_dir}/{name_model}.pt", map_location=device))
-    logger.info(f"Training complete. Best val loss: {best_val:.4f}")
-    return model
-
