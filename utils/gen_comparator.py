@@ -1,7 +1,7 @@
 import numpy as np
 import torch
 import matplotlib.pyplot as plt
-from sklearn.preprocessing import MinMaxScaler
+from sklearn.preprocessing import MinMaxScaler, QuantileTransformer
 
 
 def ks_1d(x: np.ndarray, y: np.ndarray) -> float:
@@ -117,7 +117,7 @@ def prange(a: np.ndarray, b: np.ndarray, qlo=0.01, qhi=0.99):
     return lo, hi
 
 
-def inverse_scale(t: torch.Tensor, scaler_mother : MinMaxScaler = MinMaxScaler()) -> torch.Tensor:
+def inverse_scale(t: torch.Tensor, scaler_mother : QuantileTransformer) -> torch.Tensor:
     if scaler_mother is not None:
         return scaler_mother.inverse_transform(t.detach().cpu().numpy())
     else:
