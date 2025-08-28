@@ -18,7 +18,7 @@ This file is Colab‑friendly: no extra dependencies beyond PyTorch/Matplotlib.
 """
 
 from __future__ import annotations
-
+import optuna
 import math
 import logging
 from dataclasses import dataclass
@@ -32,6 +32,64 @@ import matplotlib.pyplot as plt
 from sklearn.metrics import silhouette_score  # optional
 
 logger = logging.getLogger(__name__)
+
+
+# ----------------------------
+# Scheduling
+# ----------------------------
+
+
+
+def make_warmup_hold(max_v=0.7, warmup_frac=0.5, start_frac=0.0):
+    """
+    Lineal: sube desde 0 hasta max_v entre start_frac·E y (start_frac+warmup_frac)·E.
+    Luego queda constante en max_v.
+    """
+    def sched(e, E):
+        t = e / float(E)
+        if t <= start_frac:
+            return 0.0
+        a = (t - start_frac) / max(1e-8, warmup_frac)   # 0→1 en la ventana de warmup
+        a = max(0.0, min(1.0, a))
+        return max_v * a
+    return sched
+
+
+def make_cosine_hold(max_v=0.7, warmup_frac=0.5, start_frac=0.0):
+    """
+    Suavizado coseno: inicia en 0, sube suavemente a max_v y se queda ahí.
+    """
+    import math
+    def sched(e, E):
+        t = e / float(E)
+        if t <= start_frac:
+            return 0.0
+        a = (t - start_frac) / max(1e-8, warmup_frac)
+        a = max(0.0, min(1.0, a))
+        return max_v * (0.5 - 0.5 * math.cos(math.pi * a))  # 0→max_v en warmup
+    return sched
+
+
+def make_exp_saturating(max_v=0.7, half_life_frac=0.2):
+    """
+    Exponencial saturante: λ2(e) = max_v * (1 - 2^(-e/(half_life_frac·E))).
+    Llega asintóticamente a max_v y no lo supera.
+    """
+    import math
+    def sched(e, E):
+        k = math.log(2.0) / max(1e-8, half_life_frac * E)  # media-vida en fracción de E
+        return max_v * (1.0 - math.exp(-k * e))
+    return sched
+
+
+
+
+
+
+
+
+
+
 
 # ----------------------------
 # Loss Interfaces & Registry
@@ -491,3 +549,114 @@ def latent_metrics(zs, ys, prior):
         maha = (diff.norm() / math.sqrt(cov)).item()
 
     return sil, maha
+
+
+# --- GPU Cache in case of having an idle system ----
+
+import math
+import torch
+from torch.utils.data import IterableDataset, DataLoader, TensorDataset
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import QuantileTransformer
+
+# ---- tu API previa (usadas como caja negra) ----
+# from utils.data_handling import open_hdf, scale_muon_data
+# from utils.synth import create_lvl2_mask
+
+# ---- Dataset iterable que sube bloques a GPU (como antes) ----
+class _GPUBlockBatchedDataset(IterableDataset):
+    def __init__(self, X_cpu, M_cpu, batch_size, device, target_gb=5.0, safety=0.6, shuffle=True, seed=42):
+        super().__init__()
+        self.X = X_cpu.contiguous()
+        self.M = M_cpu.contiguous()
+        self.bs = int(batch_size)
+        self.dev = device
+        self.shuffle = bool(shuffle)
+        self.rng = torch.Generator(device="cpu").manual_seed(seed)
+        N, D = self.X.shape
+        bytes_per_sample = D * 4  # float32
+        target_bytes = target_gb * (1024**3) * safety
+        block_elems = max(self.bs, int(target_bytes // bytes_per_sample))
+        self.block_size = max(self.bs, min(N, block_elems))
+
+    def __iter__(self):
+        N = self.X.shape[0]
+        idx = torch.randperm(N, generator=self.rng) if self.shuffle else torch.arange(N)
+        for s in range(0, N, self.block_size):
+            e = min(N, s + self.block_size)
+            ib = idx[s:e]
+            # non_blocking aprovecha pin_memory() si estuvo disponible
+            x_block = self.X[ib].to(self.dev, non_blocking=True)
+            m_block = self.M[ib].to(self.dev, non_blocking=True)
+            B = x_block.shape[0]
+            for bs in range(0, B, self.bs):
+                be = min(B, bs + self.bs)
+                yield (x_block[bs:be], m_block[bs:be])
+    def __len__(self):
+        N = self.X.shape[0]
+        return max(1, math.ceil(N / self.bs))  # nº de mini-batches por época
+
+
+def prepare_guided_dataloaders_gpu_cached(
+    path_lvl1: str,
+    batch_size: int = 8192,
+    q_pz: float = 0.8,
+    q_pt: float = 0.8,
+    test_size: float = 0.2,
+    random_state: int = 42,
+    plotdir: str | None = None,
+    scaler_mother: QuantileTransformer = QuantileTransformer(),
+    device: str | torch.device = "cuda",
+    target_gpu_cache_gb: float = 5.0,
+    safety: float = 0.6,
+    shuffle: bool = True,
+):
+    # 1) Carga + 2) Escala + 3) Máscara
+    data = open_hdf(inpath=path_lvl1, key="mothers_data")
+    scaled, scaler, _ = scale_muon_data(data, plotdir, scaler_mother)
+    mask = create_lvl2_mask(data, q_pz=q_pz, q_pt=q_pt)
+
+    # 4) Split
+    X_tr, X_va, m_tr, m_va = train_test_split(
+        scaled, mask, test_size=test_size, stratify=mask, random_state=random_state
+    )
+
+    # 5) Tensores CPU (primero) y pin_memory DESPUÉS
+    #    Nota: usar from_numpy evita copias extra
+    X_tr_t = torch.from_numpy(X_tr).to(dtype=torch.float32)
+    X_va_t = torch.from_numpy(X_va).to(dtype=torch.float32)
+    m_tr_t = torch.from_numpy(m_tr).to(dtype=torch.bool)
+    m_va_t = torch.from_numpy(m_va).to(dtype=torch.bool)
+
+    have_cuda = torch.cuda.is_available()
+    dev = torch.device(device if have_cuda else "cpu")
+
+    if have_cuda:
+        # pinnear solo features (lo que pesa de verdad)
+        try:
+            X_tr_t = X_tr_t.pin_memory()
+            X_va_t = X_va_t.pin_memory()
+            # m_tr_t / m_va_t es pequeño; no es necesario pinnearlo
+        except RuntimeError:
+            # si por alguna razón no se puede, seguimos sin pin
+            pass
+    else:
+        # Sin GPU: devolvemos loaders estándar
+        def _mk_loader(X, m):
+            ds = TensorDataset(X, m)
+            return DataLoader(ds, batch_size=batch_size, shuffle=True, num_workers=0)
+        return _mk_loader(X_tr_t, m_tr_t), _mk_loader(X_va_t, m_va_t), scaler
+
+    ds_train = _GPUBlockBatchedDataset(
+        X_tr_t, m_tr_t, batch_size=batch_size, device=dev,
+        target_gb=target_gpu_cache_gb, safety=safety, shuffle=shuffle, seed=random_state
+    )
+    ds_val = _GPUBlockBatchedDataset(
+        X_va_t, m_va_t, batch_size=batch_size, device=dev,
+        target_gb=max(1.0, target_gpu_cache_gb * 0.25), safety=safety, shuffle=False, seed=random_state
+    )
+
+    train_loader = DataLoader(ds_train, batch_size=None, shuffle=False, num_workers=0, pin_memory=False)
+    val_loader   = DataLoader(ds_val,   batch_size=None, shuffle=False, num_workers=0, pin_memory=False)
+
+    return train_loader, val_loader, scaler

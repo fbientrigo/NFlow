@@ -177,5 +177,33 @@ def _plot_angular_histogram(data_true, data_gen, bins, range_, label, output_nam
     return
 
 
-# ---- For logging ----
+# ---- For plotting at colab ----
+
+# ---------- helpers ----------
+def pT(px, py): return np.hypot(px, py)
+
+def qrange(data, qlo=0.01, qhi=0.99):
+    lo = np.quantile(data, qlo); hi = np.quantile(data, qhi)
+    if not np.isfinite(lo) or not np.isfinite(hi) or lo == hi:
+        lo, hi = float(np.min(data)), float(np.max(data))
+        if lo == hi: lo, hi = lo - 1.0, hi + 1.0
+    return lo, hi
+
+def joint_range(a, b, qlo=0.01, qhi=0.99):
+    lo1, hi1 = qrange(a, qlo, qhi)
+    lo2, hi2 = qrange(b, qlo, qhi)
+    return min(lo1, lo2), max(hi1, hi2)
+
+
+
+# ---------- mask based in quantiles of real set ----------
+def make_lvl2_mask(x, q_pz=0.8, q_pt=0.8):
+    """
+    This just assumes a quantile way of defining high impacticity
+    """
+    px, py, pz = x[:,0], x[:,1], x[:,2]
+    pt = pT(px, py)
+    thr_pz = np.quantile(pz, q_pz)
+    thr_pt = np.quantile(pt, q_pt)
+    return (pz >= thr_pz) & (pt >= thr_pt), thr_pz, thr_pt
 
