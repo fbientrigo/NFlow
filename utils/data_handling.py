@@ -10,6 +10,7 @@ prepare PyTorch DataLoaders, compute kinematic angles, and scale muon features f
 import logging
 import os
 import pickle
+import gzip
 
 import h5py
 import matplotlib.pyplot as plt
@@ -17,6 +18,9 @@ import numpy as np
 import torch
 from sklearn.preprocessing import QuantileTransformer, MinMaxScaler
 from torch.utils.data import TensorDataset
+from pathlib import Path
+from torch.utils.data import Dataset, DataLoader
+
 
 logger = logging.getLogger(__name__)
 
@@ -254,3 +258,139 @@ def scale_muon_data(mothers_df: np.ndarray,
 
     logger.info("Done plotting pre and post scaling features for mothers.")
     return mother_scaled, scaler_mother, raw_features
+
+
+# ---- Open de data files from pkl ----
+# this datasets where created with simulation procedure
+
+
+def load_muon_data(file_path: str, apply_space_conversion: bool = False) -> np.ndarray:
+    """
+    Loads a .pkl.gz or .pkl file (optionally gzip-compressed) containing a numpy.ndarray.
+    The array must have shape (N, 8) with columns:
+    [px, py, pz, x, y, z, id, w]
+
+    Parameters
+    ----------
+    file_path : str
+        File path
+
+    Returns
+    -------
+    np.ndarray
+        Array of shape (N, 8) with columns:
+        [px, py, pz, x, y, z, id, w]
+    """
+    if not os.path.exists(file_path):
+        raise FileNotFoundError(f"File not found: {file_path}")
+
+    # Abrir con gzip si es necesario
+    open_fn = gzip.open # if file_path.endswith((".gz", ".gzip")) else open
+    with open_fn(file_path, "rb") as f:
+        data = pickle.load(f)
+
+    if not isinstance(data, np.ndarray) or data.shape[1] != 8:
+        raise ValueError("The file must contain a numpy.array of shape (N,8)")
+    
+    # TOTALK
+    if apply_space_conversion:
+        # The position data in FairShip was described to be in cm
+        # and the z was shifted to be z=0 at the entrance of the MuonShield.
+        data[:, 3:6] /= 100.0 # Convert cm to m
+        data[:, 5] += 68.5  # Shift z to the origin at the target
+
+    return data
+
+
+def filter_by_id(data: np.ndarray, muon_id: int | None) -> np.ndarray:
+    """
+    Filters rows by a specific id.
+    Parameters
+    ----------
+    data : np.ndarray
+    muon_id : int | None
+
+    Returns
+    -------
+    np.ndarray
+    """
+    if muon_id is None:
+        return data
+    return data[data[:, 6] == muon_id]
+
+
+# ----- Muon Dataset ----
+
+
+class MuonDataset(Dataset):
+    """
+    Dataset de muones a partir de un archivo .pkl o .pkl.gz
+
+    Cada item devuelve:
+        features: Tensor[7] (px, py, pz, x, y, z, id)
+        weight:   Tensor[]  (w)
+    """
+
+    def __init__(self, arr:np.ndarray):
+
+        if not isinstance(arr, np.ndarray):
+            raise TypeError("arr its not numpy.ndarray as expected")
+        if arr.ndim != 2 or arr.shape[1] != 8:
+            raise ValueError(f"Expected 8 columns, but found {arr.shape}")
+
+        # tensor f32 conversion
+        self.features = torch.as_tensor(arr[:, :7], dtype=torch.float32)
+        self.weights = torch.as_tensor(arr[:, 7], dtype=torch.float32)
+
+    def __len__(self) -> int:
+        return self.features.shape[0]
+
+    def __getitem__(self, idx: int):
+        return self.features[idx], self.weights[idx]
+
+
+def build_muon_dataloader(
+    data: np.ndarray,
+    batch_size: int = 128,
+    shuffle: bool = True,
+    num_workers: int = 0,
+    pin_memory: bool = True,
+) -> DataLoader:
+    """
+    Construye un DataLoader de PyTorch para el archivo de muones.
+
+    Parameters
+    ----------
+    path : str | Path
+        Ruta al archivo .pkl o .pkl.gz
+    batch_size : int
+    shuffle : bool
+    num_workers : int
+    pin_memory : bool
+
+    Returns
+    -------
+    DataLoader
+    """
+    dataset = MuonDataset(data)
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+    )
+
+
+# -- testing --
+def test_dataset_shapes(data_path):
+    ds = MuonDataset(data_path)
+    assert ds.features.shape[1] == 7
+    assert ds.weights.ndim == 1
+
+def test_first_item_type(data_path):
+    x, w = MuonDataset(data_path)[0]
+    assert isinstance(x, torch.Tensor)
+    assert isinstance(w, torch.Tensor)
+    assert x.dtype == torch.float32
+    assert w.dtype == torch.float32

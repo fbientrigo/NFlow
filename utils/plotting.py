@@ -207,3 +207,139 @@ def make_lvl2_mask(x, q_pz=0.8, q_pt=0.8):
     thr_pt = np.quantile(pt, q_pt)
     return (pz >= thr_pz) & (pt >= thr_pt), thr_pz, thr_pt
 
+# ---------- plotting Muon Data ----------
+from .data_handling import filter_by_id
+
+
+def _weighted_kde(x, y, w, xlabel, ylabel, title, out_path, cmap):
+    """Generate the weighted 2D KDE plot and save to file."""
+    plt.figure(figsize=(6, 5))
+    sns.kdeplot(
+        x=x, y=y, weights=w, fill=True, cmap=cmap, cbar=True, thresh=0.01
+    )
+    plt.xlabel(xlabel)
+    plt.ylabel(ylabel)
+    plt.title(title)
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=300)
+    plt.close()
+
+
+def plot_muon_maps(data : np.ndarray,
+                   muon_id: int | None = None,
+                   output_dir: str = "figs_muons",
+                   cmap: str = "mako",
+                   max_points: int | None = None   # ← NUEVO argumento opcional
+                   ) -> None:
+    """
+    Filters by particle id and generate four 2D maps, saved as PNG files:
+    - x vs y
+    - sqrt(x²+y²) vs z
+    - px vs py
+    - sqrt(px²+py²) vs pz
+    Each map is a weighted KDE plot using the weights from the data.
+
+    Parameters
+    ----------
+    data : np.array
+    muon_id : int | None
+    output_dir : str
+    cmap : str
+    max_points : int | None
+        Maximum number of events to plot (random sample).
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    #data = filter_by_id(load_muon_data(file_path), muon_id)
+    data = filter_by_id(data, muon_id)
+
+    # --- NUEVO: muestreo aleatorio si se especifica ---
+    if max_points is not None and len(data) > max_points:
+        idx = np.random.choice(len(data), size=max_points, replace=False)
+        data = data[idx]
+
+    px, py, pz, x, y, z, _, w = [data[:, i] for i in range(8)]
+    r_xy = np.sqrt(x**2 + y**2)
+    pt   = np.sqrt(px**2 + py**2)
+
+    plots = [
+        (x, y,           "x [m]",     "y [m]",        "Map x vs y",        "x_vs_y.png"),
+        (r_xy, z,        "r_xy [m]",  "z [m]",        "Map sqrt(x²+y²) vs z", "r_xy_vs_z.png"),
+        (px, py,         "px [GeV/c]","py [GeV/c]",   "Map px vs py",      "px_vs_py.png"),
+        (pt, pz,         "pt [GeV/c]","pz [GeV/c]",   "Map sqrt(px²+py²) vs pz","pt_vs_pz.png"),
+    ]
+
+    for xdat, ydat, xlabel, ylabel, title, fname in plots:
+        out_path = os.path.join(output_dir, fname)
+        _weighted_kde(xdat, ydat, w, xlabel, ylabel, title, out_path, cmap)
+
+
+def plot_muon_histograms(
+    data: np.ndarray,
+    muon_id: int | None = None,
+    output_dir: str = "figs_muons",
+    cmap: str = "mako",
+    max_points: int | None = None
+) -> None:
+    """
+    Genera histogramas 1D ponderados de las variables físicas:
+    p_T, p_z, x, y, z y energía relativista E.
+
+    Parameters
+    ----------
+    data: np.ndarray
+        File with loaded muon data.
+    muon_id : int | None
+        Filtra por ID de partícula si se especifica.
+    output_dir : str
+        Carpeta de salida de las figuras.
+    cmap : str
+        Paleta de colores de seaborn/matplotlib.
+    max_points : int | None
+        Número máximo de eventos a muestrear para evitar saturar memoria.
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    # data = filter_by_id(load_muon_data(file_path), muon_id)
+    data = filter_by_id(data, muon_id)
+
+    # Muestreo opcional para no sobrecargar memoria
+    if max_points is not None and len(data) > max_points:
+        idx = np.random.choice(len(data), size=max_points, replace=False)
+        data = data[idx]
+
+    # Separar columnas
+    px, py, pz, x, y, z, _, w = [data[:, i] for i in range(8)]
+    pT = np.sqrt(px**2 + py**2)
+
+    # Masa del muón en GeV/c^2
+    m_mu = 0.105658
+    p_abs = np.sqrt(px**2 + py**2 + pz**2)
+    E = np.sqrt(p_abs**2 + m_mu**2)
+
+    variables = [
+        (pT, "p_T [GeV/c]", "Histograma de p_T", "hist_pT.png"),
+        (pz, "p_z [GeV/c]", "Histograma de p_z", "hist_pz.png"),
+        (x,  "x [m]",       "Histograma de x",   "hist_x.png"),
+        (y,  "y [m]",       "Histograma de y",   "hist_y.png"),
+        (z,  "z [m]",       "Histograma de z",   "hist_z.png"),
+        (E,  "E [GeV]",     "Histograma de Energía", "hist_E.png"),
+    ]
+
+    for values, xlabel, title, fname in variables:
+        # Aseguramos que `values` y `w` tengan la misma longitud
+        assert len(values) == len(w), \
+            f"Longitudes distintas: {len(values)} vs {len(w)}"
+
+        plt.figure(figsize=(6, 4))
+        sns.histplot(
+            x=values,                # <─ forzamos modo long-form
+            weights=w,               # pesos del mismo tamaño
+            bins=50,
+            kde=False,
+            color=sns.color_palette(cmap, n_colors=1)[0]
+        )
+        plt.xlabel(xlabel)
+        plt.ylabel("Eventos ponderados")
+        plt.title(title)
+        plt.tight_layout()
+        plt.savefig(os.path.join(output_dir, fname), dpi=300)
+        plt.close()
