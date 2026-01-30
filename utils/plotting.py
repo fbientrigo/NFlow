@@ -1,12 +1,10 @@
 import logging
 import os
-
 import matplotlib.gridspec as gridspec
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import seaborn as sns
-
 from utils.data_handling import compute_angles
 
 logger = logging.getLogger(__name__)
@@ -281,21 +279,21 @@ def plot_muon_histograms(
     max_points: int | None = None
 ) -> None:
     """
-    Genera histogramas 1D ponderados de las variables físicas:
-    p_T, p_z, x, y, z y energía relativista E.
+    Generate weighted 1D histograms of physical variables:
+    p_T, p_z, x, y, z, and relativistic energy E.
 
     Parameters
     ----------
     data: np.ndarray
         File with loaded muon data.
     muon_id : int | None
-        Filtra por ID de partícula si se especifica.
+        PDG code for filtering particle.
     output_dir : str
-        Carpeta de salida de las figuras.
+        Output directory for saving plots.
     cmap : str
-        Paleta de colores de seaborn/matplotlib.
+        Color palette seaborn/matplotlib.
     max_points : int | None
-        Número máximo de eventos a muestrear para evitar saturar memoria.
+        Maximum number of events to sample to avoid memory overload.
     """
     os.makedirs(output_dir, exist_ok=True)
     # data = filter_by_id(load_muon_data(file_path), muon_id)
@@ -316,12 +314,12 @@ def plot_muon_histograms(
     E = np.sqrt(p_abs**2 + m_mu**2)
 
     variables = [
-        (pT, "p_T [GeV/c]", "Histograma de p_T", "hist_pT.png"),
-        (pz, "p_z [GeV/c]", "Histograma de p_z", "hist_pz.png"),
-        (x,  "x [m]",       "Histograma de x",   "hist_x.png"),
-        (y,  "y [m]",       "Histograma de y",   "hist_y.png"),
-        (z,  "z [m]",       "Histograma de z",   "hist_z.png"),
-        (E,  "E [GeV]",     "Histograma de Energía", "hist_E.png"),
+        (pT, "p_T [GeV/c]", "Histogram p_T", "hist_pT.png"),
+        (pz, "p_z [GeV/c]", "Histogram p_z", "hist_pz.png"),
+        (x,  "x [m]",       "Histogram x",   "hist_x.png"),
+        (y,  "y [m]",       "Histogram y",   "hist_y.png"),
+        (z,  "z [m]",       "Histogram z",   "hist_z.png"),
+        (E,  "E [GeV]",     "Histogram Energy", "hist_E.png"),
     ]
 
     for values, xlabel, title, fname in variables:

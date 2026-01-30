@@ -361,8 +361,8 @@ def build_muon_dataloader(
 
     Parameters
     ----------
-    path : str | Path
-        Ruta al archivo .pkl o .pkl.gz
+    data : np.ndarray
+        proviene del archivo .pkl o .pkl.gz
     batch_size : int
     shuffle : bool
     num_workers : int
